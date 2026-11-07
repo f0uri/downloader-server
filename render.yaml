@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: reel-downloader
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DOWNLOADER_API_KEY
+        generateValue: true
