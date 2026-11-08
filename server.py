@@ -315,7 +315,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if urlparse(self.path).path == "/health":
-            return self._send(200, {"ok": True, "version": "1.0"})
+            return self._send(200, {"ok": True, "version": "1.1"})
         return self._send(404, {"ok": False, "error": "NOT_FOUND"})
 
     def do_POST(self):
