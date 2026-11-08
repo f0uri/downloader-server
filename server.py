@@ -5,6 +5,7 @@ import html as htmllib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import urllib.request
@@ -24,6 +25,12 @@ YTDLP = os.environ.get("YTDLP_BIN", "yt-dlp")
 PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 IG_COOKIES_B64 = os.environ.get("IG_COOKIES_B64", "").strip()
 COOKIES_FILE = ""
+# Public base URL of this container, for serving merged files
+# (/dl/<shortcode>.mp4). Override with env when the hostname changes.
+PUBLIC_BASE = os.environ.get(
+    "PUBLIC_BASE",
+    "https://downloader-server-946e7.containers.snapdeploy.app").rstrip("/")
+MERGED_DIR = os.path.join(tempfile.gettempdir(), "merged")
 CACHE_TTL = 600
 MAX_PARSE_CONCURRENT = 3
 RATE_LIMIT = 20          # requests per minute per IP
@@ -135,6 +142,60 @@ def pick_formats(info):
     video_only.sort(key=lambda x: -x["height"])
     audio_only.sort(key=lambda x: -x["size"])
     return muxed, video_only, audio_only
+
+
+def _dl_media(url, path, timeout=40):
+    req = urllib.request.Request(url, headers={"User-Agent": _IG_UAS[0]})
+    with urllib.request.urlopen(req, timeout=timeout) as r, open(path, "wb") as f:
+        shutil.copyfileobj(r, f, 1024 * 256)
+    return os.path.getsize(path) > 0
+
+
+def merge_dash(video_url, audio_url, shortcode):
+    """Instagram reels now arrive DASH-only: split video + audio, so a
+    plain <video> tag plays silent. Download both, mux with ffmpeg
+    (-c copy, faststart) and serve the merged file. Returns
+    (public_url, size) or None on any failure (caller keeps video-only)."""
+    if not shortcode or not re.fullmatch(r"[A-Za-z0-9_-]{6,20}", shortcode):
+        return None
+    try:
+        os.makedirs(MERGED_DIR, exist_ok=True)
+        out = os.path.join(MERGED_DIR, shortcode + ".mp4")
+        if os.path.exists(out) and os.path.getsize(out) > 100000:
+            return f"{PUBLIC_BASE}/dl/{shortcode}.mp4", os.path.getsize(out)
+        vpath = os.path.join(MERGED_DIR, shortcode + ".v")
+        apath = os.path.join(MERGED_DIR, shortcode + ".a")
+        if not _dl_media(video_url, vpath):
+            return None
+        if not _dl_media(audio_url, apath):
+            return None
+        tmp = out + ".tmp"
+        p = subprocess.run(
+            ["ffmpeg", "-y", "-i", vpath, "-i", apath, "-c", "copy",
+             "-movflags", "+faststart", tmp],
+            capture_output=True, text=True, timeout=90)
+        if p.returncode != 0 or not os.path.exists(tmp):
+            log(f"merge fail {shortcode}: {(p.stderr or '')[-200:]}")
+            return None
+        os.replace(tmp, out)
+        for x in (vpath, apath):
+            try:
+                os.remove(x)
+            except OSError:
+                pass
+        try:
+            files = sorted(
+                (os.path.join(MERGED_DIR, f) for f in os.listdir(MERGED_DIR)
+                 if f.endswith(".mp4")),
+                key=os.path.getmtime)
+            for old in files[:-50]:
+                os.remove(old)
+        except OSError:
+            pass
+        return f"{PUBLIC_BASE}/dl/{shortcode}.mp4", os.path.getsize(out)
+    except Exception as e:
+        log(f"merge error {shortcode}: {e}")
+        return None
 
 
 def setup_cookies():
@@ -283,6 +344,20 @@ def parse_url(url):
         return {"ok": False, "error": "NO_FORMATS",
                 "message": "مالقيتش حتى جودة للتحميل"}
     best = (muxed or video_only)[0]
+    if not muxed and audio_only:
+        # DASH-only: the best video has no sound on its own — merge the
+        # audio in and serve the muxed file, so player + download both
+        # have sound. Falls back to video-only if the merge fails.
+        merged = merge_dash(best["url"], audio_only[0]["url"],
+                            info.get("id") or "")
+        if merged:
+            murl, msize = merged
+            best = {"id": "merged", "ext": "mp4", "height": best["height"],
+                    "size": msize, "url": murl, "kind": "video",
+                    "label": best["label"]}
+    formats = muxed[:6] + video_only[:4] + audio_only[:2]
+    if best.get("id") == "merged":
+        formats = [best] + formats
     result = {
         "ok": True,
         "platform": platform_of(urlparse(url).netloc.lower()),
@@ -293,7 +368,7 @@ def parse_url(url):
         "uploader": info.get("uploader"),
         "bestUrl": best["url"],
         "bestLabel": best["label"],
-        "formats": muxed[:6] + video_only[:4] + audio_only[:2],
+        "formats": formats,
     }
     cache_put(url, result)
     return result
@@ -317,9 +392,31 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("X-API-Key") == API_KEY
 
     def do_GET(self):
-        if urlparse(self.path).path == "/health":
-            return self._send(200, {"ok": True, "version": "1.2"})
+        path = urlparse(self.path).path
+        if path == "/health":
+            return self._send(200, {"ok": True, "version": "1.3"})
+        m = re.fullmatch(r"/dl/([A-Za-z0-9_-]{6,20})\.mp4", path)
+        if m:
+            return self._serve_merged(m.group(1))
         return self._send(404, {"ok": False, "error": "NOT_FOUND"})
+
+    def _serve_merged(self, shortcode):
+        fpath = os.path.join(MERGED_DIR, shortcode + ".mp4")
+        if not os.path.isfile(fpath):
+            return self._send(404, {"ok": False, "error": "NOT_FOUND"})
+        try:
+            size = os.path.getsize(fpath)
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.end_headers()
+            with open(fpath, "rb") as f:
+                shutil.copyfileobj(f, self.wfile, 1024 * 256)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log(f"serve merged fail: {e}")
 
     def do_POST(self):
         if urlparse(self.path).path != "/api/parse":
