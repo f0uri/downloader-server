@@ -258,6 +258,9 @@ def parse_url(url):
         err = raw.lower()
         if "unsupported url" in err or "no video formats" in err:
             code, msg = "UNSUPPORTED", "هاد الرابط غير مدعوم"
+        elif ("certain audiences" in err or "isn't available to everyone" in err
+              or "age-restricted" in err or "not available in your country" in err):
+            code, msg = "RESTRICTED", "هاد الريل مقيد (عمر/بلد/جمهور)، كيحتاج حساب"
         elif ("rate-limit" in err or "login required" in err
               or "empty media response" in err or "log in" in err):
             code, msg = "IG_BLOCKED", "إنستغرام كيحبس السيرفر، عاود من بعد"
@@ -315,7 +318,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if urlparse(self.path).path == "/health":
-            return self._send(200, {"ok": True, "version": "1.1"})
+            return self._send(200, {"ok": True, "version": "1.2"})
         return self._send(404, {"ok": False, "error": "NOT_FOUND"})
 
     def do_POST(self):
