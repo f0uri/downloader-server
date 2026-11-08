@@ -50,7 +50,7 @@ BANNER = r"""
 | | | | | | | |/ _ \| |/ / |/ _ \ / _` |/ _` |/ _ \ '__|
 | |_| | | |_| | (_) |   <| | (_) | (_| | (_| |  __/ |
 |____/  |____/ \___/|_|\_\_|\___/ \__,_|\__,_|\___|_|
-            Downloader Server v1.0
+            Downloader Server v1.3
 """
 
 # ---------------- state ----------------
@@ -172,7 +172,7 @@ def merge_dash(video_url, audio_url, shortcode):
         tmp = out + ".tmp"
         p = subprocess.run(
             ["ffmpeg", "-y", "-i", vpath, "-i", apath, "-c", "copy",
-             "-movflags", "+faststart", tmp],
+             "-movflags", "+faststart", "-f", "mp4", tmp],
             capture_output=True, text=True, timeout=90)
         if p.returncode != 0 or not os.path.exists(tmp):
             log(f"merge fail {shortcode}: {(p.stderr or '')[-200:]}")
