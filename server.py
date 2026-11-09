@@ -13,7 +13,7 @@ import urllib.request
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs, quote
 
 # ---------------- config ----------------
 PORT = int(os.environ.get("PORT", "8000"))
@@ -51,7 +51,7 @@ BANNER = r"""
 | | | | | | | |/ _ \| |/ / |/ _ \ / _` |/ _` |/ _ \ '__|
 | |_| | | |_| | (_) |   <| | (_) | (_| | (_| |  __/ |
 |____/  |____/ \___/|_|\_\_|\___/ \__,_|\__,_|\___|_|
-            Downloader Server v1.3
+            Downloader Server v1.4
 """
 
 # ---------------- state ----------------
@@ -248,11 +248,13 @@ def _deep_unescape(t):
 
 
 def ig_embed_fallback(url):
-    """Own-code fallback: read video_url from the public embed page.
-    Same server IP as yt-dlp, so it only helps when yt-dlp's own
-    extractor chain is the thing that broke (not a pure IP block).
-    Paced + UA-rotated like the reference implementation: 1.2s min gap
-    between attempts, retry on 429, 10 min cooldown after a 429."""
+    """Primary Instagram method (same as the reference implementation):
+    read video_url from the public embed page, then serve the file
+    through our own /api/dl proxy so playback + download both go
+    through the server. The direct CDN mp4 is muxed (video+audio),
+    so no DASH merge is needed. Falls back to yt-dlp when the embed
+    page has no video_url. Paced + UA-rotated: 1.2s min gap between
+    attempts, retry on 429, 10 min cooldown after a 429."""
     global _EMBED_LAST, _EMBED_BLOCKED_UNTIL
     m = re.search(r"instagram\.com/(?:[^/]+/)?(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)", url)
     if not m:
@@ -290,6 +292,11 @@ def ig_embed_fallback(url):
             if not v:
                 continue
             vurl = v.group(1).replace("\\", "")
+            # Route playback + download through our own proxy (same as the
+            # reference implementation) so the app needs no code change:
+            # bestUrl is the proxy URL, the file streams from the server.
+            proxy = (f"{PUBLIC_BASE}/api/dl?u={quote(vurl, safe='')}"
+                     f"&name={sc}")
             thumb = re.search(r'"display_url":"(https?://[^"]+)"', text)
             user = re.search(r'"username":"([^"]+)"', text)
             return {
@@ -298,9 +305,9 @@ def ig_embed_fallback(url):
                 "thumbnail": thumb.group(1).replace("\\", "") if thumb else None,
                 "duration": None,
                 "uploader": user.group(1) if user else None,
-                "bestUrl": vurl, "bestLabel": "MP4",
+                "bestUrl": proxy, "bestLabel": "MP4",
                 "formats": [{"id": "embed", "ext": "mp4", "height": 0,
-                             "size": 0, "url": vurl,
+                             "size": 0, "url": proxy,
                              "kind": "video", "label": "MP4"}],
             }
     return None
@@ -318,6 +325,15 @@ def parse_url(url):
     if cached is not None:
         return cached
     is_ig = "instagram.com" in url
+    # Instagram first: the embed-page method (same as the reference
+    # implementation) — one fetch, muxed mp4 with sound, no cookies,
+    # no yt-dlp, no merge. yt-dlp stays as the fallback.
+    if is_ig:
+        fb = ig_embed_fallback(url)
+        if fb:
+            log("embed primary OK")
+            cache_put(url, fb)
+            return fb
     with _parse_sem:
         try:
             p = run_ytdlp(url, use_cookies=False)
@@ -406,6 +422,12 @@ def parse_url(url):
 
 
 # ---------------- http ----------------
+_PROXY_ALLOWED = (
+    "cdninstagram.com", "fbcdn.net",
+    "scontent.cdninstagram.com", "unavatar.io",
+)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -423,13 +445,73 @@ class Handler(BaseHTTPRequestHandler):
         return self.headers.get("X-API-Key") == API_KEY
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/health":
-            return self._send(200, {"ok": True, "version": "1.3"})
+            return self._send(200, {"ok": True, "version": "1.4"})
+        if path == "/api/dl":
+            return self._serve_proxy(parsed)
         m = re.fullmatch(r"/dl/([A-Za-z0-9_-]{6,20})\.mp4", path)
         if m:
             return self._serve_merged(m.group(1))
         return self._send(404, {"ok": False, "error": "NOT_FOUND"})
+
+    def _serve_proxy(self, parsed):
+        """Lovable-style download proxy: stream a CDN file through the
+        server as an attachment (Range passthrough for seeking/resume).
+        Only Instagram/Facebook CDN hosts are allowed."""
+        qs = parse_qs(parsed.query)
+        target = (qs.get("u") or [None])[0]
+        name = (qs.get("name") or ["instagram"])[0]
+        if not target:
+            return self._send(400, {"ok": False, "error": "BAD_REQUEST"})
+        try:
+            up = urlparse(target)
+        except Exception:
+            return self._send(400, {"ok": False, "error": "BAD_URL"})
+        host = (up.netloc or "").lower()
+        if up.scheme != "https" or not any(
+                host == d or host.endswith("." + d) for d in _PROXY_ALLOWED):
+            return self._send(403, {"ok": False, "error": "FORBIDDEN"})
+        headers = {
+            "User-Agent": _IG_UAS[0],
+            "Referer": "https://www.instagram.com/",
+        }
+        if self.headers.get("Range"):
+            headers["Range"] = self.headers.get("Range")
+        try:
+            req = urllib.request.Request(target, headers=headers)
+            with urllib.request.urlopen(req, timeout=40) as r:
+                ctype = (r.headers.get("Content-Type")
+                         or "application/octet-stream")
+                length = r.headers.get("Content-Length")
+                crange = r.headers.get("Content-Range")
+                body = None
+                if not length:
+                    body = r.read()
+                    length = str(len(body))
+                ext = "mp4" if "video" in ctype else "jpg"
+                safe = re.sub(r"[^A-Za-z0-9_.-]", "", name) or "instagram"
+                self.send_response(r.status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", length)
+                if crange:
+                    self.send_header("Content-Range", crange)
+                self.send_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{safe}.{ext}"')
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                if body is not None:
+                    self.wfile.write(body)
+                else:
+                    shutil.copyfileobj(r, self.wfile, 1024 * 256)
+        except urllib.error.HTTPError:
+            return self._send(404, {"ok": False, "error": "UPSTREAM_ERROR"})
+        except Exception as e:
+            log(f"proxy dl fail: {e}")
+            return self._send(502, {"ok": False, "error": "UPSTREAM_ERROR"})
 
     def _serve_merged(self, shortcode):
         fpath = os.path.join(MERGED_DIR, shortcode + ".mp4")
