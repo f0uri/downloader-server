@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import urllib.error
 import urllib.request
 import threading
 import time
@@ -249,22 +250,39 @@ def _deep_unescape(t):
 def ig_embed_fallback(url):
     """Own-code fallback: read video_url from the public embed page.
     Same server IP as yt-dlp, so it only helps when yt-dlp's own
-    extractor chain is the thing that broke (not a pure IP block)."""
+    extractor chain is the thing that broke (not a pure IP block).
+    Paced + UA-rotated like the reference implementation: 1.2s min gap
+    between attempts, retry on 429, 10 min cooldown after a 429."""
+    global _EMBED_LAST, _EMBED_BLOCKED_UNTIL
     m = re.search(r"instagram\.com/(?:[^/]+/)?(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)", url)
     if not m:
         return None
     sc = m.group(1)
+    if time.time() < _EMBED_BLOCKED_UNTIL:
+        return None
     handler = urllib.request.ProxyHandler(
         {"http": PROXY_URL, "https": PROXY_URL}) if PROXY_URL else urllib.request.ProxyHandler()
     opener = urllib.request.build_opener(handler)
     for ua in _IG_UAS:
         for path in (f"reel/{sc}/embed/captioned/", f"p/{sc}/embed/captioned/"):
+            with _EMBED_LOCK:
+                wait = _EMBED_MIN_GAP - (time.time() - _EMBED_LAST)
+                if wait > 0:
+                    time.sleep(wait)
+                _EMBED_LAST = time.time()
             try:
                 req = urllib.request.Request(
                     f"https://www.instagram.com/{path}",
                     headers={"User-Agent": ua, "Accept-Language": "en-US,en;q=0.9"})
                 with opener.open(req, timeout=20) as r:
                     text = _deep_unescape(r.read().decode("utf-8", "ignore"))
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    _EMBED_BLOCKED_UNTIL = time.time() + _EMBED_COOLDOWN
+                    log("embed fallback: 429, cooling down 10 min")
+                    return None
+                log(f"embed fallback {path}: {e}")
+                continue
             except Exception as e:
                 log(f"embed fallback {path}: {e}")
                 continue
@@ -286,6 +304,13 @@ def ig_embed_fallback(url):
                              "kind": "video", "label": "MP4"}],
             }
     return None
+
+
+_EMBED_LAST = 0.0
+_EMBED_BLOCKED_UNTIL = 0.0
+_EMBED_LOCK = threading.Lock()
+_EMBED_MIN_GAP = 1.2
+_EMBED_COOLDOWN = 600
 
 
 def parse_url(url):
@@ -341,6 +366,12 @@ def parse_url(url):
         info = info["entries"][0]
     muxed, video_only, audio_only = pick_formats(info)
     if not muxed and not video_only:
+        if is_ig:
+            fb = ig_embed_fallback(url)
+            if fb:
+                log("embed fallback OK (no formats)")
+                cache_put(url, fb)
+                return fb
         return {"ok": False, "error": "NO_FORMATS",
                 "message": "مالقيتش حتى جودة للتحميل"}
     best = (muxed or video_only)[0]
