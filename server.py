@@ -1,3 +1,4 @@
+# redeploy trigger 2026-11-10 01:45 — v1.4 auto-deploy was blocked by SnapDeploy limit, re-triggering
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import base64
