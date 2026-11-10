@@ -1,4 +1,3 @@
-# redeploy trigger 2026-11-10 01:45 — v1.4 auto-deploy was blocked by SnapDeploy limit, re-triggering
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import base64
@@ -20,6 +19,18 @@ from urllib.parse import urlparse, parse_qs, quote
 PORT = int(os.environ.get("PORT", "8000"))
 API_KEY = os.environ.get("DOWNLOADER_API_KEY", "")
 YTDLP = os.environ.get("YTDLP_BIN", "yt-dlp")
+# v1.5 license check (Reel Checker 4.4.6):
+#   REELCHECKER_APP_SECRET — shared secret injected into genuine CI
+#   builds only (--dart-define from the GitHub Secret). A build from
+#   cloned source has an empty secret and is refused.
+#   LICENSED_DEVICES — comma-separated ANDROID_IDs allowed to use
+#   the servers (owner's phone first). Empty = any device with the
+#   right secret is licensed (secret-only mode).
+APP_SECRET = os.environ.get("REELCHECKER_APP_SECRET", "").strip()
+LICENSED_DEVICES = {
+    d.strip() for d in os.environ.get("LICENSED_DEVICES", "").split(",")
+    if d.strip()
+}
 # Optional, OFF by default (owner decides):
 #   PROXY_URL       e.g. http://user:pass@host:port  (residential proxy)
 #   IG_COOKIES_B64  base64 of a Netscape cookies.txt from a THROWAWAY
@@ -449,7 +460,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/health":
-            return self._send(200, {"ok": True, "version": "1.4"})
+            return self._send(200, {"ok": True, "version": "1.5"})
         if path == "/api/dl":
             return self._serve_proxy(parsed)
         m = re.fullmatch(r"/dl/([A-Za-z0-9_-]{6,20})\.mp4", path)
@@ -532,8 +543,40 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             log(f"serve merged fail: {e}")
 
+    def _license_check(self, data):
+        """v1.5: {device_id, app_secret} -> licensed true/false.
+        Refused when the secret is missing/wrong, or when the
+        allowlist is set and the device is not on it. When no secret
+        is configured at all, enforcement is OFF (fail-open)."""
+        if not APP_SECRET:
+            return True
+        if (data.get("app_secret") or "") != APP_SECRET:
+            return False
+        if LICENSED_DEVICES and \
+                (data.get("device_id") or "") not in LICENSED_DEVICES:
+            return False
+        return True
+
+    def _handle_license(self):
+        ip = self.client_address[0]
+        if not rate_ok(ip):
+            return self._send(429, {"ok": False, "error": "RATE_LIMIT",
+                                    "message": "بزاف ديال الطلبات، تسنى شوية"})
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            data = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            return self._send(400, {"ok": False, "error": "BAD_REQUEST"})
+        licensed = self._license_check(data)
+        log(f"license device={(data.get('device_id') or '')[:8]} "
+            f"licensed={licensed}")
+        return self._send(200, {"licensed": licensed})
+
     def do_POST(self):
-        if urlparse(self.path).path != "/api/parse":
+        path = urlparse(self.path).path
+        if path == "/api/license":
+            return self._handle_license()
+        if path != "/api/parse":
             return self._send(404, {"ok": False, "error": "NOT_FOUND"})
         ip = self.client_address[0]
         if not rate_ok(ip):
@@ -567,5 +610,6 @@ if __name__ == "__main__":
     setup_cookies()
     log(f"listening on 0.0.0.0:{PORT} | yt-dlp: {YTDLP} | "
         f"auth: {'ON' if API_KEY else 'OFF (dev)'} | "
+        f"license: {'ON' if APP_SECRET else 'off'} | "
         f"proxy: {'ON' if PROXY_URL else 'off'} | cookies: {'ON' if COOKIES_FILE else 'off'}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
